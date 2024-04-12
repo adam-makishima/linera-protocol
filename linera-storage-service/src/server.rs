@@ -1,10 +1,12 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, ops::Deref, slice::Chunks, sync::Arc};
 
 use async_lock::RwLock;
-use linera_storage_service::common::{KeyTag, MAX_PAYLOAD_SIZE};
+use clap::parser::Values;
+use key_value_store::{statement, OptValue};
+use linera_storage_service::common::{KeyTag, MAX_PAYLOAD_SIZE,MAX_KEY_SIZE};
 use linera_views::{
     batch::Batch,
     common::{CommonStoreConfig, ReadableKeyValueStore, WritableKeyValueStore},
@@ -15,20 +17,30 @@ use linera_views::{
     common::AdminKeyValueStore,
     rocks_db::{RocksDbStore, RocksDbStoreConfig},
 };
-use serde::Serialize;
-use tonic::{transport::Server, Request, Response, Status};
+use serde::{de::value, Serialize};
+use tonic::{transport::Server, Request, Response, Status, Streaming};
+
+use std::pin::Pin;
+use tokio::sync::mpsc;
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+
+use deepsize::DeepSizeOf;
 
 use crate::key_value_store::{
     statement::Operation,
     store_processor_server::{StoreProcessor, StoreProcessorServer},
-    KeyValue, OptValue, ReplyContainsKey, ReplyCreateNamespace, ReplyDeleteAll,
+    KeyValue, ReplyContainsKey, ReplyCreateNamespace, ReplyDeleteAll,
     ReplyDeleteNamespace, ReplyExistsNamespace, ReplyFindKeyValuesByPrefix, ReplyFindKeysByPrefix,
-    ReplyListAll, ReplyReadMultiValues, ReplyReadValue, ReplySpecificChunk,
-    ReplyWriteBatchExtended, RequestContainsKey, RequestCreateNamespace, RequestDeleteAll,
+    ReplyListAll, ReplyReadMultiValues, ReplyReadValue,
+    ReplyWriteBatch, RequestContainsKey, RequestCreateNamespace, RequestDeleteAll,
     RequestDeleteNamespace, RequestExistsNamespace, RequestFindKeyValuesByPrefix,
     RequestFindKeysByPrefix, RequestListAll, RequestReadMultiValues, RequestReadValue,
-    RequestSpecificChunk, RequestWriteBatchExtended,
+    RequestWriteBatch
 };
+
+
+#[derive(DeepSizeOf)]
+struct DeepSizeWrapper(Option<Vec<u8>>,bool);
 
 #[allow(clippy::derive_partial_eq_without_eq)]
 // https://github.com/hyperium/tonic/issues/1056
@@ -36,34 +48,24 @@ pub mod key_value_store {
     tonic::include_proto!("key_value_store.v1");
 }
 
-enum ServiceStoreServerInternal {
+enum ServiceStoreServer {
     Memory(MemoryStore),
     /// The RocksDb key value store
     #[cfg(feature = "rocksdb")]
     RocksDb(RocksDbStore),
 }
 
-#[derive(Default)]
-struct PendingBigReads {
-    index: i64,
-    chunks_by_index: BTreeMap<i64, Vec<Vec<u8>>>,
-}
-
-struct ServiceStoreServer {
-    store: ServiceStoreServerInternal,
-    pending_big_puts: Arc<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>,
-    pending_big_reads: Arc<RwLock<PendingBigReads>>,
-}
+//const MAX_KEY_SIZE: usize = 1000000;
 
 impl ServiceStoreServer {
     pub async fn read_value_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Status> {
-        match &self.store {
-            ServiceStoreServerInternal::Memory(store) => store
+        match self {
+            ServiceStoreServer::Memory(store) => store
                 .read_value_bytes(key)
                 .await
                 .map_err(|_e| Status::not_found("read_value_bytes")),
             #[cfg(feature = "rocksdb")]
-            ServiceStoreServerInternal::RocksDb(store) => store
+            ServiceStoreServer::RocksDb(store) => store
                 .read_value_bytes(key)
                 .await
                 .map_err(|_e| Status::not_found("read_value_bytes")),
@@ -71,13 +73,13 @@ impl ServiceStoreServer {
     }
 
     pub async fn contains_key(&self, key: &[u8]) -> Result<bool, Status> {
-        match &self.store {
-            ServiceStoreServerInternal::Memory(store) => store
+        match self{
+            ServiceStoreServer::Memory(store) => store
                 .contains_key(key)
                 .await
                 .map_err(|_e| Status::not_found("contains_key")),
             #[cfg(feature = "rocksdb")]
-            ServiceStoreServerInternal::RocksDb(store) => store
+            ServiceStoreServer::RocksDb(store) => store
                 .contains_key(key)
                 .await
                 .map_err(|_e| Status::not_found("contains_key")),
@@ -88,13 +90,13 @@ impl ServiceStoreServer {
         &self,
         keys: Vec<Vec<u8>>,
     ) -> Result<Vec<Option<Vec<u8>>>, Status> {
-        match &self.store {
-            ServiceStoreServerInternal::Memory(store) => store
+        match self{
+            ServiceStoreServer::Memory(store) => store
                 .read_multi_values_bytes(keys)
                 .await
                 .map_err(|_e| Status::not_found("read_multi_values_bytes")),
             #[cfg(feature = "rocksdb")]
-            ServiceStoreServerInternal::RocksDb(store) => store
+            ServiceStoreServer::RocksDb(store) => store
                 .read_multi_values_bytes(keys)
                 .await
                 .map_err(|_e| Status::not_found("read_multi_values_bytes")),
@@ -102,13 +104,13 @@ impl ServiceStoreServer {
     }
 
     pub async fn find_keys_by_prefix(&self, key_prefix: &[u8]) -> Result<Vec<Vec<u8>>, Status> {
-        match &self.store {
-            ServiceStoreServerInternal::Memory(store) => store
+        match self {
+            ServiceStoreServer::Memory(store) => store
                 .find_keys_by_prefix(key_prefix)
                 .await
                 .map_err(|_e| Status::not_found("find_keys_by_prefix")),
             #[cfg(feature = "rocksdb")]
-            ServiceStoreServerInternal::RocksDb(store) => store
+            ServiceStoreServer::RocksDb(store) => store
                 .find_keys_by_prefix(key_prefix)
                 .await
                 .map_err(|_e| Status::not_found("find_keys_by_prefix")),
@@ -119,13 +121,13 @@ impl ServiceStoreServer {
         &self,
         key_prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Status> {
-        match &self.store {
-            ServiceStoreServerInternal::Memory(store) => store
+        match self {
+            ServiceStoreServer::Memory(store) => store
                 .find_key_values_by_prefix(key_prefix)
                 .await
                 .map_err(|_e| Status::not_found("find_key_values_by_prefix")),
             #[cfg(feature = "rocksdb")]
-            ServiceStoreServerInternal::RocksDb(store) => store
+            ServiceStoreServer::RocksDb(store) => store
                 .find_key_values_by_prefix(key_prefix)
                 .await
                 .map_err(|_e| Status::not_found("find_key_values_by_prefix")),
@@ -133,13 +135,13 @@ impl ServiceStoreServer {
     }
 
     pub async fn write_batch(&self, batch: Batch) -> Result<(), Status> {
-        match &self.store {
-            ServiceStoreServerInternal::Memory(store) => store
+        match self{
+            ServiceStoreServer::Memory(store) => store
                 .write_batch(batch, &[])
                 .await
                 .map_err(|_e| Status::not_found("write_batch")),
             #[cfg(feature = "rocksdb")]
-            ServiceStoreServerInternal::RocksDb(store) => store
+            ServiceStoreServer::RocksDb(store) => store
                 .write_batch(batch, &[])
                 .await
                 .map_err(|_e| Status::not_found("write_batch")),
@@ -182,21 +184,6 @@ impl ServiceStoreServer {
         self.write_batch(batch).await
     }
 
-    pub async fn insert_pending_read<S: Serialize>(&self, value: S) -> (i64, i32) {
-        let value = bcs::to_bytes(&value).unwrap();
-        let chunks = value
-            .chunks(MAX_PAYLOAD_SIZE)
-            .map(|x| x.to_vec())
-            .collect::<Vec<_>>();
-        let num_chunks = chunks.len() as i32;
-        let mut pending_big_reads = self.pending_big_reads.write().await;
-        let message_index = pending_big_reads.index;
-        pending_big_reads.index += 1;
-        pending_big_reads
-            .chunks_by_index
-            .insert(message_index, chunks);
-        (message_index, num_chunks)
-    }
 }
 
 #[derive(clap::Parser)]
@@ -224,32 +211,47 @@ enum ServiceStoreServerOptions {
 
 #[tonic::async_trait]
 impl StoreProcessor for ServiceStoreServer {
+
+    type ProcessReadValueStream = ReceiverStream<Result<ReplyReadValue, Status>>;
+
     async fn process_read_value(
         &self,
         request: Request<RequestReadValue>,
-    ) -> Result<Response<ReplyReadValue>, Status> {
+    ) -> Result<Response<Self::ProcessReadValueStream>, Status> {
+        let (mut tx, rx) = mpsc::channel(4);
         let request = request.into_inner();
         let RequestReadValue { key } = request;
         let value = self.read_value_bytes(&key).await?;
-        let size = match &value {
-            None => 0,
-            Some(value) => value.len(),
-        };
-        let response = if size < MAX_PAYLOAD_SIZE {
-            ReplyReadValue {
-                value,
-                message_index: 0,
-                num_chunks: 0,
+        match value{
+            Some(value)=>{
+                if value.len()<=MAX_PAYLOAD_SIZE{
+                    tokio::spawn(async move {
+                        tx.send(Ok(ReplyReadValue {value:Some(value) })).await;
+                    });
+                    return Ok(Response::new(ReceiverStream::new(rx)))
+                }
+                let chunks = value
+                    .chunks(MAX_PAYLOAD_SIZE)
+                    .map(|x| x.to_vec())
+                    .collect::<Vec<_>>();
+                let num_of_chunks = chunks.len() ;
+                tokio::spawn(async move {
+                    for index in 0..num_of_chunks{
+                        tx.send(Ok(ReplyReadValue { value:Some(chunks[index].clone())})).await;
+                    }
+                });
+                Ok(Response::new(ReceiverStream::new(rx)))
+
             }
-        } else {
-            let (message_index, num_chunks) = self.insert_pending_read(value).await;
-            ReplyReadValue {
-                value: None,
-                message_index,
-                num_chunks,
+            None=>{
+                tokio::spawn(async move {
+                    tx.send(Ok(ReplyReadValue {value:None })).await;
+                });
+                return Ok(Response::new(ReceiverStream::new(rx)))
             }
-        };
-        Ok(Response::new(response))
+
+        }
+
     }
 
     async fn process_contains_key(
@@ -263,165 +265,241 @@ impl StoreProcessor for ServiceStoreServer {
         Ok(Response::new(response))
     }
 
+    type ProcessReadMultiValuesStream = ReceiverStream<Result<ReplyReadMultiValues, Status>>;
+
     async fn process_read_multi_values(
         &self,
-        request: Request<RequestReadMultiValues>,
-    ) -> Result<Response<ReplyReadMultiValues>, Status> {
-        let request = request.into_inner();
-        let RequestReadMultiValues { keys } = request;
-        let values = self.read_multi_values_bytes(keys.clone()).await?;
-        let size = values
-            .iter()
-            .map(|x| match x {
-                None => 0,
-                Some(entry) => entry.len(),
-            })
-            .sum::<usize>();
-        let response = if size < MAX_PAYLOAD_SIZE {
-            let values = values
-                .into_iter()
-                .map(|value| OptValue { value })
-                .collect::<Vec<_>>();
-            ReplyReadMultiValues {
-                values,
-                message_index: 0,
-                num_chunks: 0,
+        request: Request<Streaming<RequestReadMultiValues>>,
+    ) -> Result<Response<Self::ProcessReadMultiValuesStream>, Status> {
+        let (tx, rx) = mpsc::channel(4);
+
+        let mut stream = request.into_inner();
+        let mut values = Vec::new();
+        while let Some(RequestReadMultiValues { keys }) = stream.message().await?{
+            let mut inner_values = self.read_multi_values_bytes(keys).await?;
+            values.append(&mut inner_values);
+        }
+        let values = values
+            .into_iter()
+            .map(|value| if value.is_some(){
+                    let mut chunks = value.unwrap()
+                    .chunks(MAX_PAYLOAD_SIZE)
+                    .map(|x|x.to_vec())
+                    .map(|x|OptValue{value:Some(x),last_chunk:false})
+                    .collect::<Vec<_>>();
+                    if let Some(mut last_chunk) = chunks.pop(){
+                        last_chunk.last_chunk = true;
+                        chunks.push(last_chunk);
+                    }else{
+                        chunks.push(OptValue{value:Some(vec![]),last_chunk:true});
+                    }
+                    chunks
+                }else{
+                    vec![OptValue { value:value, last_chunk:true }]
+                }
+            )
+            .flatten()
+            .collect::<Vec<_>>();
+
+            //grouping values in sizes of 4M chunks
+            let mut grouped_values = Vec::new();
+            let mut chunk = Vec::new();
+            let mut chunk_size = 0;
+            for value in values{
+                let value_size = DeepSizeWrapper(value.value.clone(),value.clone().last_chunk).deep_size_of();
+                if chunk_size+value_size<=MAX_PAYLOAD_SIZE{
+                    chunk.push(value);
+                    grouped_values.pop();
+                    grouped_values.push(chunk.clone());
+                    chunk_size+=value_size;
+                }
+                else {
+                    chunk.clear();
+                    chunk_size=0;
+                    chunk.push(value);
+                    grouped_values.push(chunk.clone());
+                    chunk_size+=value_size;
+                }
             }
-        } else {
-            let (message_index, num_chunks) = self.insert_pending_read(values).await;
-            ReplyReadMultiValues {
-                values: Vec::default(),
-                message_index,
-                num_chunks,
+
+            tokio::spawn(async move {
+                for value in grouped_values{
+                tx.send(Ok(ReplyReadMultiValues { values:value})).await;
             }
-        };
-        Ok(Response::new(response))
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+    type ProcessFindKeysByPrefixStream = ReceiverStream<Result<ReplyFindKeysByPrefix, Status>>;
+
 
     async fn process_find_keys_by_prefix(
         &self,
         request: Request<RequestFindKeysByPrefix>,
-    ) -> Result<Response<ReplyFindKeysByPrefix>, Status> {
+    ) -> Result<Response<Self::ProcessFindKeysByPrefixStream>, Status> {
+        let (tx, rx) = mpsc::channel(4);
         let request = request.into_inner();
         let RequestFindKeysByPrefix { key_prefix } = request;
         let keys = self.find_keys_by_prefix(&key_prefix).await?;
-        let size = keys.iter().map(|x| x.len()).sum::<usize>();
-        let response = if size < MAX_PAYLOAD_SIZE {
-            ReplyFindKeysByPrefix {
-                keys,
-                message_index: 0,
-                num_chunks: 0,
+
+        if keys.len()==0{
+            tokio::spawn(async move {
+                tx.send(Ok(ReplyFindKeysByPrefix {keys})).await;
+            });
+            return Ok(Response::new(ReceiverStream::new(rx)));
+        }
+        let mut grouped_keys = Vec::new();
+        let mut chunk = Vec::new();
+        let mut chunk_size = 0;
+        for key in keys{
+            let key_size = key.len();
+            if key_size+chunk_size<=MAX_PAYLOAD_SIZE{
+                chunk.push(key);
+                grouped_keys.pop();
+                grouped_keys.push(chunk.clone());
+                chunk_size+=key_size;
             }
-        } else {
-            let (message_index, num_chunks) = self.insert_pending_read(keys).await;
-            ReplyFindKeysByPrefix {
-                keys: Vec::default(),
-                message_index,
-                num_chunks,
+            else{
+                chunk.clear();
+                chunk_size=0;
+                chunk.push(key);
+                grouped_keys.push(chunk.clone());
+                chunk_size+=key_size;
+
             }
-        };
-        Ok(Response::new(response))
+        }
+
+        tokio::spawn(async move {
+            for keys in grouped_keys{
+                tx.send(Ok(ReplyFindKeysByPrefix {keys})).await;
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+    type ProcessFindKeyValuesByPrefixStream = ReceiverStream<Result<ReplyFindKeyValuesByPrefix, Status>>;
 
     async fn process_find_key_values_by_prefix(
         &self,
         request: Request<RequestFindKeyValuesByPrefix>,
-    ) -> Result<Response<ReplyFindKeyValuesByPrefix>, Status> {
+    ) -> Result<Response<Self::ProcessFindKeyValuesByPrefixStream>, Status> {
+        let ( tx, rx) = mpsc::channel(4);
         let request = request.into_inner();
         let RequestFindKeyValuesByPrefix { key_prefix } = request;
         let key_values = self.find_key_values_by_prefix(&key_prefix).await?;
-        let size = key_values
-            .iter()
-            .map(|x| x.0.len() + x.1.len())
-            .sum::<usize>();
-        let response = if size < MAX_PAYLOAD_SIZE {
-            let key_values = key_values
-                .into_iter()
-                .map(|x| KeyValue {
-                    key: x.0,
-                    value: x.1,
-                })
-                .collect::<Vec<_>>();
-            ReplyFindKeyValuesByPrefix {
-                key_values,
-                message_index: 0,
-                num_chunks: 0,
+        let key_values = key_values
+        .iter()
+        .map(|key_value|{
+                let key_size = key_value.0.len();
+                let mut value = [0u8,0,0,1].to_vec();
+                value.append(&mut key_value.1.clone());
+                let value_size = value.len();
+                let mut chunk = Vec::new();
+                if key_size+value_size<=MAX_PAYLOAD_SIZE{
+                    chunk.push(KeyValue{key:key_value.0.clone(),value:value.clone()});
+                    return chunk
+                }
+                let mut chunks = value
+                    .chunks(MAX_KEY_SIZE)
+                    .map(|x|x.to_vec())
+                    .collect::<Vec<_>>();
+                let num_of_chunks = (chunks.len() as u32)
+                    .to_be_bytes()
+                    .to_vec();
+                chunks[0].splice(0..4, num_of_chunks);
+                chunk.push(KeyValue{key:key_value.0.clone(),value:chunks[0].clone()});
+                for i in 1..chunks.len(){
+                    chunk.push(KeyValue{key:vec![], value:chunks[i].clone()});
+                }
+                chunk
             }
-        } else {
-            let (message_index, num_chunks) = self.insert_pending_read(key_values).await;
-            ReplyFindKeyValuesByPrefix {
-                key_values: Vec::default(),
-                message_index,
-                num_chunks,
+        )
+        .flatten()
+        .collect::<Vec<_>>();
+
+        if key_values.len()==0{
+            tokio::spawn(async move {
+                tx.send(Ok(ReplyFindKeyValuesByPrefix {key_values})).await;
+            });
+            return Ok(Response::new(ReceiverStream::new(rx)));
+        }
+
+        let mut grouped_key_values = Vec::new();
+        let mut chunk = Vec::new();
+        let mut chunk_size = 0;
+        for key_value in key_values{
+            let key_size = key_value.key.len();
+            let value_size = key_value.value.len();
+            if key_size+value_size+chunk_size<=MAX_PAYLOAD_SIZE{
+                chunk.push(key_value);
+                grouped_key_values.pop();
+                grouped_key_values.push(chunk.clone());
+                chunk_size+=key_size+value_size;
             }
-        };
-        Ok(Response::new(response))
+            else{
+                chunk.clear();
+                chunk_size=0;
+                chunk.push(key_value);
+                grouped_key_values.push(chunk.clone());
+                chunk_size+=key_size+value_size;
+
+            }
+        }
+        tokio::spawn(async move {
+            for key_values in grouped_key_values{
+                tx.send(Ok(ReplyFindKeyValuesByPrefix { key_values})).await;
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn process_write_batch_extended(
+    async fn process_write_batch(
         &self,
-        request: Request<RequestWriteBatchExtended>,
-    ) -> Result<Response<ReplyWriteBatchExtended>, Status> {
-        let request = request.into_inner();
-        let RequestWriteBatchExtended { statements } = request;
+        request: Request<Streaming<RequestWriteBatch>>,
+    ) -> Result<Response<ReplyWriteBatch>, Status> {
+        let mut stream = request.into_inner();
         let mut batch = Batch::default();
-        for statement in statements {
-            match statement.operation.unwrap() {
-                Operation::Delete(key) => {
-                    batch.delete_key(key);
-                }
-                Operation::Put(key_value) => {
-                    batch.put_key_value_bytes(key_value.key, key_value.value);
-                }
-                Operation::Append(key_value_append) => {
-                    let mut pending_big_puts = self.pending_big_puts.write().await;
-                    match pending_big_puts.get_mut(&key_value_append.key) {
-                        None => {
-                            pending_big_puts
-                                .insert(key_value_append.key.clone(), key_value_append.value);
+        let mut key_value_recombined = KeyValue { key: Vec::new(), value: Vec::new() };
+        let mut num_of_chunks = 0u32;
+        while let Some(Ok(RequestWriteBatch { statements })) = stream.next().await{
+
+            for statement in statements {
+                match statement.operation.unwrap() {
+                    Operation::Delete(key) => {
+                        batch.delete_key(key);
+                    },
+                    Operation::Put(key_value) => {
+                        let mut value = key_value.value.clone();
+                        if num_of_chunks == 0{
+                            num_of_chunks  = u32::from_be_bytes(<[u8;4]>::try_from(value
+                                .drain(0..4)
+                                .as_slice())
+                                .unwrap());
+                            key_value_recombined = KeyValue{key :key_value.key , value : vec![]};
                         }
-                        Some(value) => {
-                            value.extend(key_value_append.value);
+                        if num_of_chunks == 1{
+                            key_value_recombined.value.extend(value);
+                            num_of_chunks-=1;
+                            batch.put_key_value_bytes(key_value_recombined.key.clone(),key_value_recombined.value.clone());
+                        }else{
+                            key_value_recombined.value.extend(value);
+                            num_of_chunks-=1;
                         }
-                    }
-                    if key_value_append.last {
-                        let value = pending_big_puts.remove(&key_value_append.key).unwrap();
-                        batch.put_key_value_bytes(key_value_append.key, value);
-                    }
-                }
-                Operation::DeletePrefix(key_prefix) => {
-                    batch.delete_key_prefix(key_prefix);
+
+                    },
+                    Operation::DeletePrefix(key_prefix) => {
+                        batch.delete_key_prefix(key_prefix);
+                    },
                 }
             }
         }
-        if batch.size() > 0 {
-            self.write_batch(batch).await?;
-        }
-        let response = ReplyWriteBatchExtended {};
+        self.write_batch(batch).await?;
+        let response = ReplyWriteBatch {};
         Ok(Response::new(response))
     }
 
-    async fn process_specific_chunk(
-        &self,
-        request: Request<RequestSpecificChunk>,
-    ) -> Result<Response<ReplySpecificChunk>, Status> {
-        let request = request.into_inner();
-        let RequestSpecificChunk {
-            message_index,
-            index,
-        } = request;
-        let mut pending_big_reads = self.pending_big_reads.write().await;
-        let Some(entry) = pending_big_reads.chunks_by_index.get(&message_index) else {
-            return Err(Status::not_found("process_specific_chunk"));
-        };
-        let index = index as usize;
-        let chunk = entry[index].clone();
-        if entry.len() == index + 1 {
-            pending_big_reads.chunks_by_index.remove(&message_index);
-        }
-        let response = ReplySpecificChunk { chunk };
-        Ok(Response::new(response))
-    }
+
 
     async fn process_create_namespace(
         &self,
@@ -473,6 +551,7 @@ impl StoreProcessor for ServiceStoreServer {
         let response = ReplyDeleteAll {};
         Ok(Response::new(response))
     }
+
 }
 
 #[tokio::main]
@@ -482,8 +561,7 @@ async fn main() {
     let (store, endpoint) = match options {
         ServiceStoreServerOptions::Memory { endpoint } => {
             let store = create_memory_store_stream_queries(common_config.max_stream_queries);
-            let store = ServiceStoreServerInternal::Memory(store);
-            (store, endpoint)
+            (ServiceStoreServer::Memory(store), endpoint)
         }
         #[cfg(feature = "rocksdb")]
         ServiceStoreServerOptions::RocksDb { path, endpoint } => {
@@ -496,16 +574,8 @@ async fn main() {
             let store = RocksDbStore::maybe_create_and_connect(&config, namespace)
                 .await
                 .expect("store");
-            let store = ServiceStoreServerInternal::RocksDb(store);
-            (store, endpoint)
+            (ServiceStoreServer::RocksDb(store), endpoint)
         }
-    };
-    let pending_big_puts = Arc::new(RwLock::new(BTreeMap::default()));
-    let pending_big_reads = Arc::new(RwLock::new(PendingBigReads::default()));
-    let store = ServiceStoreServer {
-        store,
-        pending_big_puts,
-        pending_big_reads,
     };
     let endpoint = endpoint.parse().unwrap();
     Server::builder()

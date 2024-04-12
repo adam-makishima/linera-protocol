@@ -350,7 +350,8 @@ pub fn get_random_test_scenarios() -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
     scenarios
 }
 
-fn generate_random_batch<R: Rng>(rng: &mut R, key_prefix: &[u8], batch_size: usize) -> Batch {
+///generatees a random batch
+pub fn generate_random_batch<R: Rng>(rng: &mut R, key_prefix: &[u8], batch_size: usize) -> Batch {
     let mut batch = Batch::new();
     // Fully random batch
     for _ in 0..batch_size {
@@ -359,7 +360,10 @@ fn generate_random_batch<R: Rng>(rng: &mut R, key_prefix: &[u8], batch_size: usi
         if choice < 6 {
             // Insert
             let key = get_small_key_space(rng, key_prefix, 4);
-            let len_value = rng.gen_range(0..10); // Could need to be split
+            let len_value = rng.gen_range(0..100); // Could need to be split
+            let value = get_random_byte_vector(rng, &[], len_value);
+            batch.put_key_value_bytes(key.clone(), value.clone());
+            let len_value = rng.gen_range(50..100); // Could need to be split
             let value = get_random_byte_vector(rng, &[], len_value);
             batch.put_key_value_bytes(key.clone(), value.clone());
         }
@@ -420,7 +424,8 @@ fn update_state_from_batch(kv_state: &mut BTreeMap<Vec<u8>, Vec<u8>>, batch: &Ba
     }
 }
 
-fn realize_batch(batch: &Batch) -> BTreeMap<Vec<u8>, Vec<u8>> {
+///applies all operations of a batch and converts it to a BtreeMap of key-value pairs
+pub fn realize_batch(batch: &Batch) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut kv_state = BTreeMap::new();
     update_state_from_batch(&mut kv_state, batch);
     kv_state

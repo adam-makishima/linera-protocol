@@ -29,6 +29,7 @@ const TEST_SHARED_STORE_MAX_STREAM_QUERIES: usize = 10;
 // We decrease the 4194304 to 4000000 to leave space for the rest of the message
 // (that includes length prefixes)
 pub const MAX_PAYLOAD_SIZE: usize = 4000000;
+pub const MAX_KEY_SIZE: usize = 1000000;
 
 /// Key tags to create the sub keys used for storing data on storage.
 #[repr(u8)]

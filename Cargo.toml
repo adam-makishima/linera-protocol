@@ -58,6 +58,7 @@ convert_case = "0.6.0"
 criterion = { version = "0.5.1", default-features = false }
 custom_debug_derive = "0.6.1"
 dashmap = "5.5.3"
+deepsize = "0.2.0"
 derive_more = "0.99.17"
 dirs = "5.0.1"
 ed25519-dalek = { version = "2.1.1", features = ["batch", "serde"] }
@@ -119,7 +120,7 @@ tonic-health = "0.11"
 tonic-reflection = "0.11"
 tonic-web = "0.11"
 tonic-web-wasm-client = "0.5.1"
-tokio = "1.36.0"
+tokio = {version = "1.36.0" ,features = ["full"]}
 tokio-stream = "0.1.14"
 tokio-test = "0.4.3"
 tokio-util = "0.7.10"

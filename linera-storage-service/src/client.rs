@@ -1,9 +1,9 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{mem, sync::Arc};
+use std::sync::Arc;
 
-use async_lock::{RwLock, RwLockWriteGuard, Semaphore, SemaphoreGuard};
+use async_lock::{RwLock, Semaphore, SemaphoreGuard};
 use linera_base::ensure;
 #[cfg(with_testing)]
 use linera_views::test_utils::generate_test_namespace;
@@ -14,24 +14,22 @@ use linera_views::{
         WritableKeyValueStore,
     },
 };
-use serde::de::DeserializeOwned;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, Endpoint, Error};
 
 use crate::{
-    common::{KeyTag, ServiceContextError, ServiceStoreConfig, MAX_PAYLOAD_SIZE},
+    common::{KeyTag, ServiceContextError, ServiceStoreConfig, MAX_PAYLOAD_SIZE,MAX_KEY_SIZE},
     key_value_store::{
-        statement::Operation, store_processor_client::StoreProcessorClient, KeyValue,
-        KeyValueAppend, ReplyContainsKey, ReplyExistsNamespace, ReplyFindKeyValuesByPrefix,
-        ReplyFindKeysByPrefix, ReplyListAll, ReplyReadMultiValues, ReplyReadValue,
-        ReplySpecificChunk, RequestContainsKey, RequestCreateNamespace, RequestDeleteAll,
-        RequestDeleteNamespace, RequestExistsNamespace, RequestFindKeyValuesByPrefix,
-        RequestFindKeysByPrefix, RequestListAll, RequestReadMultiValues, RequestReadValue,
-        RequestSpecificChunk, RequestWriteBatchExtended, Statement,
+        statement::{self, Operation}, store_processor_client::StoreProcessorClient, KeyValue,
+        OptValue, ReplyContainsKey, ReplyExistsNamespace, ReplyFindKeyValuesByPrefix, ReplyFindKeysByPrefix,
+        ReplyListAll, ReplyReadMultiValues, ReplyReadValue, RequestContainsKey, RequestCreateNamespace,
+        RequestDeleteAll, RequestDeleteNamespace, RequestExistsNamespace, RequestFindKeyValuesByPrefix,
+        RequestFindKeysByPrefix, RequestListAll, RequestReadMultiValues, RequestReadValue, RequestWriteBatch,
+        Statement,
     },
 };
 
 // The maximum key size is set to 1M rather arbitrarily.
-const MAX_KEY_SIZE: usize = 1000000;
+//const MAX_KEY_SIZE: usize = 1000000;
 
 // The shared store client.
 // * Interior mutability is required for client because
@@ -74,18 +72,22 @@ impl ReadableKeyValueStore<ServiceContextError> for ServiceStoreClient {
         let request = tonic::Request::new(query);
         let mut client = self.client.write().await;
         let _guard = self.acquire().await;
-        let response = client.process_read_value(request).await?;
-        let response = response.into_inner();
-        let ReplyReadValue {
-            value,
-            message_index,
-            num_chunks,
-        } = response;
-        if num_chunks == 0 {
-            Ok(value)
-        } else {
-            Self::read_entries(client, message_index, num_chunks).await
+        let mut response_stream = client
+            .process_read_value(request)
+            .await?
+            .into_inner();
+        let mut recombined_value = Vec::new();
+        if let Some(chunk) = response_stream.message().await?{
+            let v = &chunk.value;
+            if v.is_none(){
+                return Ok(None);
+            }
+            recombined_value.append(&mut v.clone().unwrap());
         }
+        while let Some(ReplyReadValue { value }) = response_stream.message().await?{
+            recombined_value.append(&mut value.unwrap());
+        }
+        Ok(Some(recombined_value))
     }
 
     async fn contains_key(&self, key: &[u8]) -> Result<bool, ServiceContextError> {
@@ -113,23 +115,52 @@ impl ReadableKeyValueStore<ServiceContextError> for ServiceStoreClient {
             full_key.extend(&key);
             full_keys.push(full_key);
         }
-        let query = RequestReadMultiValues { keys: full_keys };
-        let request = tonic::Request::new(query);
+        let mut grouped_keys = Vec::new();
+        let mut chunk = Vec::new();
+        let mut chunk_size = 0;
+        for key in full_keys{
+            let key_size = key.len();
+            if key_size+chunk_size<=MAX_PAYLOAD_SIZE{
+                grouped_keys.pop().unwrap_or_default();
+                chunk.push(key);
+                grouped_keys.push(chunk.clone());
+                chunk_size+=key_size;
+            }
+            else{
+                chunk.clear();
+                chunk_size=0;
+                chunk.push(key);
+                grouped_keys.push(chunk.clone());
+                chunk_size+=key_size;
+            }
+        }
+        let mut query = Vec::new();
+        for keys in grouped_keys{
+            query.push(RequestReadMultiValues { keys});
+        }
+        let request = tonic::Request::new(tokio_stream::iter(query));
         let mut client = self.client.write().await;
         let _guard = self.acquire().await;
-        let response = client.process_read_multi_values(request).await?;
-        let response = response.into_inner();
-        let ReplyReadMultiValues {
-            values,
-            message_index,
-            num_chunks,
-        } = response;
-        if num_chunks == 0 {
-            let values = values.into_iter().map(|x| x.value).collect::<Vec<_>>();
-            Ok(values)
-        } else {
-            Self::read_entries(client, message_index, num_chunks).await
+        let mut response_stream = client
+            .process_read_multi_values(request)
+            .await?
+            .into_inner();
+        let mut response = Vec::new();
+        let mut recombined_value = Vec::new() ;
+        while let Some(ReplyReadMultiValues { values }) = response_stream.message().await?{
+            for OptValue { value, last_chunk } in values{
+                if value.is_none(){
+                    response.push(value);
+                    continue;
+                }
+                recombined_value.append(&mut value.unwrap());
+                if last_chunk{
+                    response.push(Some(recombined_value.clone()));
+                    recombined_value.clear();
+                }
+            }
         }
+        Ok(response)
     }
 
     async fn find_keys_by_prefix(
@@ -148,18 +179,17 @@ impl ReadableKeyValueStore<ServiceContextError> for ServiceStoreClient {
         let request = tonic::Request::new(query);
         let mut client = self.client.write().await;
         let _guard = self.acquire().await;
-        let response = client.process_find_keys_by_prefix(request).await?;
-        let response = response.into_inner();
-        let ReplyFindKeysByPrefix {
-            keys,
-            message_index,
-            num_chunks,
-        } = response;
-        if num_chunks == 0 {
-            Ok(keys)
-        } else {
-            Self::read_entries(client, message_index, num_chunks).await
+        let mut response_stream = client
+            .process_find_keys_by_prefix(request)
+            .await?.
+            into_inner();
+        let mut  response = Vec::new();
+        while let Some(ReplyFindKeysByPrefix { keys }) = response_stream.message().await?{
+            for key in keys{
+                response.push(key);
+            }
         }
+        Ok(response)
     }
 
     async fn find_key_values_by_prefix(
@@ -178,22 +208,31 @@ impl ReadableKeyValueStore<ServiceContextError> for ServiceStoreClient {
         let request = tonic::Request::new(query);
         let mut client = self.client.write().await;
         let _guard = self.acquire().await;
-        let response = client.process_find_key_values_by_prefix(request).await?;
-        let response = response.into_inner();
-        let ReplyFindKeyValuesByPrefix {
-            key_values,
-            message_index,
-            num_chunks,
-        } = response;
-        if num_chunks == 0 {
-            let key_values = key_values
-                .into_iter()
-                .map(|x| (x.key, x.value))
-                .collect::<Vec<_>>();
-            Ok(key_values)
-        } else {
-            Self::read_entries(client, message_index, num_chunks).await
+        let mut response_stream = client
+            .process_find_key_values_by_prefix(request)
+            .await?
+            .into_inner();
+        let mut response = Vec::new();
+        let mut num_of_value_blocks = 0;
+        while let Some(ReplyFindKeyValuesByPrefix { mut key_values }) = response_stream.message().await?  {
+            for i in 0..key_values.len(){
+                if num_of_value_blocks == 0{
+                    let num_of_value_blocks_bytes : [u8;4] = <[u8;4]>::try_from(key_values[i]
+                        .value
+                        .drain(0..4)
+                        .as_slice())
+                        .unwrap();
+                    num_of_value_blocks = u32::from_be_bytes(num_of_value_blocks_bytes);
+                    response.push((key_values[i].key.clone(),key_values[i].value.clone()));
+                }else{
+                    let mut recombined_key_value = response.pop().unwrap();
+                    recombined_key_value.1.append(&mut key_values[i].value);
+                    response.push(recombined_key_value);
+                }
+                num_of_value_blocks-=1;
+            }
         }
+        Ok(response)
     }
 }
 
@@ -201,62 +240,83 @@ impl WritableKeyValueStore<ServiceContextError> for ServiceStoreClient {
     const MAX_VALUE_SIZE: usize = usize::MAX;
 
     async fn write_batch(&self, batch: Batch, _base_key: &[u8]) -> Result<(), ServiceContextError> {
-        let mut statements = Vec::new();
+        let mut chunk_of_statements = Vec::new();
         let mut chunk_size = 0;
-        for operation in batch.operations {
-            let (key_len, value_len) = match &operation {
-                WriteOperation::Delete { key } => (key.len(), 0),
-                WriteOperation::Put { key, value } => (key.len(), value.len()),
-                WriteOperation::DeletePrefix { key_prefix } => (key_prefix.len(), 0),
+        let mut statments_query:Vec<RequestWriteBatch> = Vec::new();
+        let mut operations = Vec::new();
+        for operation in batch.operations{
+            operations.push(self.get_statement(operation));
+        }
+
+        for mut statement in operations{
+            let (key_len,value_len) = match &mut statement.operation{
+                Some(Operation::Delete (key ))=>( key.len(),0),
+                Some(Operation::DeletePrefix ( key_prefix ))=>( key_prefix.len(),0),
+                Some(Operation::Put (KeyValue { key,  value } )) =>{
+                    let mut v = [0u8,0,0,1].to_vec();
+                    v.append(value);
+                    *value = v;
+                    ( key.len(),value.len())},
+                None=>continue,
             };
-            let operation_size = key_len + value_len;
-            ensure!(key_len <= MAX_KEY_SIZE, ServiceContextError::KeyTooLong);
-            if operation_size + chunk_size < MAX_PAYLOAD_SIZE {
-                let statement = self.get_statement(operation);
-                statements.push(statement);
-                chunk_size += operation_size;
-            } else {
-                self.submit_statements(mem::take(&mut statements)).await?;
-                chunk_size = 0;
-                if operation_size > MAX_PAYLOAD_SIZE {
-                    // One single operation is especially big. So split it in chunks.
-                    let WriteOperation::Put { key, value } = operation else {
-                        // Only the put can go over the limit
-                        unreachable!();
-                    };
-                    let mut full_key = self.namespace.clone();
-                    full_key.extend(key);
-                    let value_chunks = value
-                        .chunks(MAX_PAYLOAD_SIZE)
-                        .map(|x| x.to_vec())
+            if key_len+value_len+chunk_size <= MAX_PAYLOAD_SIZE{
+                statments_query.pop().unwrap_or_default();
+                chunk_of_statements.push(statement);
+                statments_query.push(RequestWriteBatch{statements:chunk_of_statements.clone()});
+                chunk_size+=key_len+value_len;
+            }else{
+                if let Some(Operation::Put(KeyValue { key, value })) = statement.operation{
+                    let mut values = value
+                        .chunks(MAX_KEY_SIZE)
+                        .map(|x|x.to_vec())
                         .collect::<Vec<_>>();
-                    let num_chunks = value_chunks.len();
-                    for (i_chunk, value) in value_chunks.into_iter().enumerate() {
-                        let last = i_chunk + 1 == num_chunks;
-                        let operation = Operation::Append(KeyValueAppend {
-                            key: full_key.clone(),
-                            value,
-                            last,
-                        });
-                        statements = vec![Statement {
-                            operation: Some(operation),
-                        }];
-                        self.submit_statements(mem::take(&mut statements)).await?;
+                    let num_of_chunks = (values.len() as u32)
+                        .to_be_bytes()
+                        .to_vec();
+                    values[0].splice(0..4, num_of_chunks);
+                    let mut keys = vec![vec![];values.len()];
+                    keys[0] = key;
+
+                    for i in 0..keys.len(){
+                        if keys[i].len()+values[i].len()+chunk_size<=MAX_PAYLOAD_SIZE{
+                            statments_query.pop();
+                            chunk_of_statements.push(Statement { operation:Some(Operation::Put(KeyValue { key: keys[i].clone(), value: values[i].clone() }) )});
+                            statments_query.push(RequestWriteBatch{statements:chunk_of_statements.clone()});
+                            chunk_size+=keys[i].len()+values[i].len();
+                        } else {
+                            chunk_of_statements.clear();
+                            chunk_size = 0;
+                            chunk_of_statements.push(Statement { operation:Some(Operation::Put(KeyValue { key: keys[i].clone(), value: values[i].clone() }) )});
+                            statments_query.push(RequestWriteBatch{statements:chunk_of_statements.clone()});
+                            chunk_size+=keys[i].len()+values[i].len();
+                        }
+
                     }
-                } else {
-                    // The operation is small enough, it is just that we have many so we need to split.
-                    let statement = self.get_statement(operation);
-                    statements.push(statement);
-                    chunk_size = operation_size;
+                    continue;
                 }
+                chunk_of_statements.clear();
+                chunk_size = 0;
+                chunk_of_statements.push(statement);
+                statments_query.push(RequestWriteBatch{statements:chunk_of_statements.clone()});
+                chunk_size+=key_len+value_len;
             }
         }
-        self.submit_statements(mem::take(&mut statements)).await
+        let request = tokio_stream::iter(statments_query);
+        let mut client = self.client.write().await;
+        let _guard = self.acquire().await;
+        let _response = client
+            .process_write_batch(request)
+            .await?
+            .into_inner();
+
+        Ok(())
+
     }
 
     async fn clear_journal(&self, _base_key: &[u8]) -> Result<(), ServiceContextError> {
         Ok(())
     }
+
 }
 
 impl KeyValueStore for ServiceStoreClient {
@@ -276,20 +336,6 @@ impl ServiceStoreClient {
         let mut key = vec![KeyTag::Key as u8];
         bcs::serialize_into(&mut key, namespace)?;
         Ok(key)
-    }
-
-    async fn submit_statements(
-        &self,
-        statements: Vec<Statement>,
-    ) -> Result<(), ServiceContextError> {
-        if !statements.is_empty() {
-            let query = RequestWriteBatchExtended { statements };
-            let request = tonic::Request::new(query);
-            let mut client = self.client.write().await;
-            let _guard = self.acquire().await;
-            let _response = client.process_write_batch_extended(request).await?;
-        }
-        Ok(())
     }
 
     fn get_statement(&self, operation: WriteOperation) -> Statement {
@@ -318,25 +364,6 @@ impl ServiceStoreClient {
         }
     }
 
-    async fn read_entries<S: DeserializeOwned>(
-        mut client: RwLockWriteGuard<'_, StoreProcessorClient<Channel>>,
-        message_index: i64,
-        num_chunks: i32,
-    ) -> Result<S, ServiceContextError> {
-        let mut value = Vec::new();
-        for index in 0..num_chunks {
-            let query = RequestSpecificChunk {
-                message_index,
-                index,
-            };
-            let request = tonic::Request::new(query);
-            let response = client.process_specific_chunk(request).await?;
-            let response = response.into_inner();
-            let ReplySpecificChunk { chunk } = response;
-            value.extend(chunk);
-        }
-        Ok(bcs::from_bytes(&value)?)
-    }
 }
 
 impl AdminKeyValueStore for ServiceStoreClient {
@@ -472,3 +499,5 @@ pub async fn create_service_test_store(
     let namespace = generate_test_namespace();
     ServiceStoreClient::connect(&config, &namespace).await
 }
+
+
